@@ -1,5 +1,6 @@
 const { runRead, runWrite } = require('./neo4j.service');
 const crypto = require('crypto');
+const debug = require('debug')('app:access:decision');
 
 function httpMethodToAction(method) {
   switch (method.toUpperCase()) {
@@ -33,16 +34,65 @@ function extractClientIp(req) {
  * Vérifie les permissions (User -> Role -> Permission -> Resource).
  */
 async function hasPermission(userId, action, resourcePath) {
+  debug(`Vérification de la permission: user=${userId}, action=${action}, resource=${resourcePath}`);
+  
+  // Nettoyer le chemin de la ressource pour le faire correspondre au format des permissions
+  const cleanPath = resourcePath
+    .replace(/^\/|\/$/g, '')  // Supprimer les slashes au début et à la fin
+    .replace(/\//g, '_')       // Remplacer les slashes par des underscores
+    .replace(/-/g, '_')        // Remplacer les tirets par des underscores
+    .toUpperCase();            // Tout en majuscules
+    
+  const permissionName = `${action.toUpperCase()}_${cleanPath}`;
+  debug(`Permission recherchée: ${permissionName}`);
+  
   const cypher = `
     MATCH (u:User {id: $userId})-[:HAS_ROLE]->(r:Role)
-          -[:GRANTS]->(p:Permission {action: $action})
-          -[:ACCESS_TO]->(res:Resource {path: $path})
+          -[:GRANTS]->(p:Permission {name: $permissionName})
+          -[:ACCESS_TO]->(res:Resource {path: $resourcePath})
     RETURN COUNT(p) > 0 AS hasPermission
   `;
+  
+  debug('Requête de permission:', cypher, { userId, permissionName, resourcePath });
 
-  const result = await runRead(cypher, { userId, action, path: resourcePath });
-  const record = result.records[0];
-  return record ? record.get('hasPermission') : false;
+  try {
+    const result = await runRead(cypher, { 
+      userId, 
+      permissionName,
+      resourcePath 
+    });
+    
+    debug('Résultat de la requête de permission:', JSON.stringify(result, null, 2));
+    
+    if (!result.records || result.records.length === 0) {
+      debug('Aucun enregistrement trouvé pour la permission');
+      return false;
+    }
+    
+    const record = result.records[0];
+    const hasPerm = record ? record.get('hasPermission') : false;
+    debug(`Permission ${hasPerm ? 'accordée' : 'refusée'}`);
+    
+    // Si la permission n'est pas trouvée, vérifier si l'utilisateur est admin
+    if (!hasPerm) {
+      const isAdminCypher = `
+        MATCH (u:User {id: $userId})-[:HAS_ROLE]->(r:Role {name: 'ADMIN'})
+        RETURN COUNT(r) > 0 AS isAdmin
+      `;
+      const adminResult = await runRead(isAdminCypher, { userId });
+      const isAdmin = adminResult.records[0]?.get('isAdmin') || false;
+      
+      if (isAdmin) {
+        debug('Accès accordé: utilisateur est ADMIN');
+        return true;
+      }
+    }
+    
+    return hasPerm;
+  } catch (error) {
+    debug('Erreur lors de la vérification de la permission:', error);
+    return false;
+  }
 }
 
 /**
@@ -133,7 +183,11 @@ async function logAccessAttempt({
  * - Première IP pour l'utilisateur   => considérée comme connue (AUTHORIZED si permission OK)
  */
 async function decideAccess(req) {
+  debug('=== Décision d\'accès ===');
+  debug(`Méthode: ${req.method}, Chemin: ${req.path}`);
+  debug('Session:', req.session);
   if (!req.session || !req.session.user) {
+    debug('Refus: aucune session utilisateur trouvée');
     return {
       status: 'REFUSED',
       reason: 'no_session',
@@ -147,10 +201,15 @@ async function decideAccess(req) {
   const resourcePath = req.path; // ressource = route demandée (sans query)
   const ipAddress = extractClientIp(req);
 
+  debug(`Vérification des permissions pour l'utilisateur ${userId} (${username})`);
+  debug(`Action: ${action}, Ressource: ${resourcePath}, IP: ${ipAddress}`);
+  
   const [permissionOk, ipState] = await Promise.all([
     hasPermission(userId, action, resourcePath),
     getIpStateForUser(userId, ipAddress),
   ]);
+  
+  debug(`Résultats - Permission: ${permissionOk}, État IP:`, ipState);
 
   let status;
   let reason;
@@ -158,6 +217,7 @@ async function decideAccess(req) {
   if (!permissionOk) {
     status = 'REFUSED';
     reason = 'no_permission';
+    debug('Refus: permissions insuffisantes');
   } else {
     if (ipState.isFirstIp || ipState.isKnownIp) {
       status = 'AUTHORIZED';

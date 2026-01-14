@@ -9,6 +9,7 @@ dotenv.config();
 const sessionMiddleware = require('./middleware/session');
 const accessControlMiddleware = require('./middleware/accessControl');
 const errorHandler = require('./middleware/errorHandler');
+const requestLogger = require('./middleware/requestLogger');
 
 // Routers
 const authRoutes = require('./routes/auth.routes');
@@ -26,6 +27,9 @@ const app = express();
 app.use(morgan('dev'));
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
+
+// Logging des requêtes
+app.use(requestLogger);
 
 // Session management (in-memory, pédagogique)
 app.use(sessionMiddleware);

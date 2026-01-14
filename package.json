@@ -9,17 +9,26 @@
     "init": "node scripts/init-data.js",
     "test": "node tests/test.js"
   },
-  "keywords": ["iam", "rbac", "neo4j", "express", "access-control"],
+  "keywords": [
+    "iam",
+    "rbac",
+    "neo4j",
+    "express",
+    "access-control"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "express": "^4.18.2",
-    "express-session": "^1.17.3",
-    "neo4j-driver": "^5.14.0",
     "cors": "^2.8.5",
-    "dotenv": "^16.3.1"
+    "dotenv": "^16.6.1",
+    "express": "^4.22.1",
+    "express-session": "^1.17.3",
+    "http-errors": "^2.0.1",
+    "morgan": "^1.10.1",
+    "neo4j-driver": "^5.28.2"
   },
   "devDependencies": {
-    "nodemon": "^3.0.1"
+    "debug": "^4.4.3",
+    "nodemon": "^3.1.11"
   }
 }
