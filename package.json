@@ -1,0 +1,25 @@
+{
+  "name": "iam-rbac-backend",
+  "version": "1.0.0",
+  "description": "Backend Node.js Express avec Neo4j pour système IAM/RBAC",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "init": "node scripts/init-data.js",
+    "test": "node tests/test.js"
+  },
+  "keywords": ["iam", "rbac", "neo4j", "express", "access-control"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.18.2",
+    "express-session": "^1.17.3",
+    "neo4j-driver": "^5.14.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}
