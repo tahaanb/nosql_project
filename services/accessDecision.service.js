@@ -2,93 +2,111 @@ const { runRead, runWrite } = require('./neo4j.service');
 const crypto = require('crypto');
 const debug = require('debug')('app:access:decision');
 
+/**
+ * Convertit une méthode HTTP en action de permission
+ */
 function httpMethodToAction(method) {
-  switch (method.toUpperCase()) {
-    case 'GET':
-      return 'READ';
-    case 'POST':
-    case 'PUT':
-    case 'PATCH':
-      return 'WRITE';
-    case 'DELETE':
-      return 'DELETE';
-    default:
-      return 'READ';
-  }
+  const methodMap = {
+    'GET': 'READ',
+    'POST': 'CREATE',
+    'PUT': 'UPDATE',
+    'PATCH': 'UPDATE',
+    'DELETE': 'DELETE',
+    'HEAD': 'READ',
+    'OPTIONS': 'READ'
+  };
+  return methodMap[method.toUpperCase()] || 'READ';
 }
 
 /**
- * Récupère l'adresse IP logique du client.
- * On reste volontairement simple : X-Forwarded-For ou remoteAddress.
+ * Récupère l'adresse IP du client en tenant compte des proxies
  */
 function extractClientIp(req) {
+  // Vérifier les en-têtes de proxy
   const xff = req.headers['x-forwarded-for'];
   if (xff) {
-    return xff.split(',')[0].trim();
+    const ips = xff.split(',').map(ip => ip.trim());
+    return ips[0] || '127.0.0.1';
   }
-  const remote = req.socket && req.socket.remoteAddress;
-  return remote || '127.0.0.1';
+  
+  // Vérifier l'en-tête CF-Connecting-IP (Cloudflare)
+  if (req.headers['cf-connecting-ip']) {
+    return req.headers['cf-connecting-ip'];
+  }
+  
+  // Vérifier l'en-tête X-Real-IP (Nginx)
+  if (req.headers['x-real-ip']) {
+    return req.headers['x-real-ip'];
+  }
+  
+  // Sinon, utiliser l'adresse distante
+  return req.socket?.remoteAddress || '127.0.0.1';
 }
 
 /**
- * Vérifie les permissions (User -> Role -> Permission -> Resource).
+ * Vérifie les permissions de l'utilisateur
  */
 async function hasPermission(userId, action, resourcePath) {
-  debug(`Vérification de la permission: user=${userId}, action=${action}, resource=${resourcePath}`);
+  debug(`\n=== DEBUT hasPermission ===`);
+  debug(`Paramètres: userId=${userId}, action=${action}, resourcePath=${resourcePath}`);
   
-  // Nettoyer le chemin de la ressource pour le faire correspondre au format des permissions
+  // Nettoyer le chemin de la ressource
   const cleanPath = resourcePath
-    .replace(/^\/|\/$/g, '')  // Supprimer les slashes au début et à la fin
-    .replace(/\//g, '_')       // Remplacer les slashes par des underscores
-    .replace(/-/g, '_')        // Remplacer les tirets par des underscores
-    .toUpperCase();            // Tout en majuscules
+    .replace(/^\/|\/$/g, '')  // Supprimer les slashes de début et de fin
+    .replace(/\/+/g, '/')      // Remplacer les slashes multiples par un seul
+    .toLowerCase();
     
-  const permissionName = `${action.toUpperCase()}_${cleanPath}`;
-  debug(`Permission recherchée: ${permissionName}`);
-  
-  const cypher = `
-    MATCH (u:User {id: $userId})-[:HAS_ROLE]->(r:Role)
-          -[:GRANTS]->(p:Permission {name: $permissionName})
-          -[:ACCESS_TO]->(res:Resource {path: $resourcePath})
-    RETURN COUNT(p) > 0 AS hasPermission
-  `;
-  
-  debug('Requête de permission:', cypher, { userId, permissionName, resourcePath });
+  debug(`Chemin nettoyé: ${cleanPath}`);
 
   try {
-    const result = await runRead(cypher, { 
+    // Vérifier d'abord si l'utilisateur est admin
+    debug(`\n[1/3] Vérification du statut administrateur pour l'utilisateur ${userId}`);
+    const isAdmin = await checkAdminStatus(userId);
+    debug(`[1/3] Résultat de checkAdminStatus: ${isAdmin}`);
+    
+    if (isAdmin) {
+      debug('=== ACCÈS ADMIN ACCORDÉ ===');
+      debug(`L'utilisateur ${userId} est administrateur, accès accordé à ${resourcePath}`);
+      return true;
+    }
+
+    // Vérifier la permission spécifique
+    const cypher = `
+      MATCH (u:User {id: $userId})-[:HAS_ROLE]->(r:Role)
+      MATCH (r)-[:GRANTS]->(p:Permission)-[:ACCESS_TO]->(res:Resource)
+      WHERE p.name STARTS WITH $action
+      AND (
+        res.path = $resourcePath OR
+        $resourcePath STARTS WITH (res.path + '/')
+      )
+      RETURN p.name as permission, res.path as resourcePath
+      LIMIT 1
+    `;
+    
+    debug('Exécution de la requête de permission:', { 
+      cypher, 
       userId, 
-      permissionName,
-      resourcePath 
+      action: action.toUpperCase() + '_',
+      resourcePath: cleanPath 
     });
     
-    debug('Résultat de la requête de permission:', JSON.stringify(result, null, 2));
+    const result = await runRead(cypher, { 
+      userId, 
+      action: action.toUpperCase() + '_',
+      resourcePath: cleanPath
+    });
     
-    if (!result.records || result.records.length === 0) {
-      debug('Aucun enregistrement trouvé pour la permission');
-      return false;
+    const hasPermission = result.records.length > 0;
+    
+    if (hasPermission) {
+      const permission = result.records[0].get('permission');
+      const resource = result.records[0].get('resourcePath');
+      debug(`Permission accordée: ${permission} pour ${resource}`);
+    } else {
+      debug('Aucune permission trouvée');
     }
     
-    const record = result.records[0];
-    const hasPerm = record ? record.get('hasPermission') : false;
-    debug(`Permission ${hasPerm ? 'accordée' : 'refusée'}`);
-    
-    // Si la permission n'est pas trouvée, vérifier si l'utilisateur est admin
-    if (!hasPerm) {
-      const isAdminCypher = `
-        MATCH (u:User {id: $userId})-[:HAS_ROLE]->(r:Role {name: 'ADMIN'})
-        RETURN COUNT(r) > 0 AS isAdmin
-      `;
-      const adminResult = await runRead(isAdminCypher, { userId });
-      const isAdmin = adminResult.records[0]?.get('isAdmin') || false;
-      
-      if (isAdmin) {
-        debug('Accès accordé: utilisateur est ADMIN');
-        return true;
-      }
-    }
-    
-    return hasPerm;
+    return hasPermission;
   } catch (error) {
     debug('Erreur lors de la vérification de la permission:', error);
     return false;
@@ -96,142 +114,128 @@ async function hasPermission(userId, action, resourcePath) {
 }
 
 /**
- * Détermine l'état de l'IP pour un utilisateur :
- * - isFirstIp: aucune IP connue pour cet utilisateur
- * - isKnownIp: IP déjà vue pour cet utilisateur
+ * Vérifie si l'utilisateur est administrateur
+ */
+async function checkAdminStatus(userId) {
+  try {
+    debug(`Vérification du statut administrateur pour l'utilisateur ${userId}`);
+    
+    const cypher = `
+      MATCH (u:User {id: $userId})-[:HAS_ROLE]->(r:Role)
+      WHERE r.name = 'ADMIN'
+      RETURN count(r) > 0 as isAdmin
+    `;
+    
+    debug(`Exécution de la requête: ${cypher} avec userId: ${userId}`);
+    
+    const result = await runRead(cypher, { userId });
+    const isAdmin = result.records[0]?.get('isAdmin') || false;
+    
+    debug(`L'utilisateur ${userId} est admin ? ${isAdmin}`);
+    return isAdmin;
+  } catch (error) {
+    debug('Erreur lors de la vérification du statut admin:', error);
+    return false;
+  }
+}
+
+/**
+ * Obtient l'état de l'IP pour un utilisateur
  */
 async function getIpStateForUser(userId, ipAddress) {
   const cypher = `
     MATCH (u:User {id: $userId})
-    OPTIONAL MATCH (u)-[:CONNECTS_FROM]->(ip:IP)
-    WITH u, COLLECT(ip.address) AS ips
-    RETURN
-      SIZE(ips) = 0 AS isFirstIp,
-      $ip IN ips AS isKnownIp
+    OPTIONAL MATCH (u)-[r:CONNECTS_FROM]->(ip:IP)
+    WITH u, 
+         COLLECT(DISTINCT {address: ip.address, firstSeen: r.firstSeen, lastSeen: r.lastSeen}) AS ips
+    RETURN {
+      isFirstIp: SIZE(ips) = 0,
+      isKnownIp: ANY(ip IN ips WHERE ip.address = $ipAddress),
+      knownIps: ips,
+      totalIps: SIZE(ips)
+    } AS ipState
   `;
 
-  const result = await runRead(cypher, { userId, ip: ipAddress });
-  if (result.records.length === 0) {
-    // Utilisateur inexistant côté graph
-    return { isFirstIp: true, isKnownIp: false };
-  }
-  const record = result.records[0];
-  return {
-    isFirstIp: record.get('isFirstIp'),
-    isKnownIp: record.get('isKnownIp'),
-  };
-}
-
-/**
- * Enregistre systématiquement la tentative d'accès en base,
- * et crée les relations demandées.
- */
-async function logAccessAttempt({
-  userId,
-  username,
-  resourcePath,
-  method,
-  action,
-  ipAddress,
-  status,
-  reason,
-}) {
-  const attemptId = crypto.randomUUID();
-
-  const cypher = `
-    MATCH (u:User {id: $userId})
-    MATCH (res:Resource {path: $path})
-    MERGE (ip:IP {address: $ip})
-    MERGE (u)-[:CONNECTS_FROM]->(ip)
-    CREATE (attempt:AccessAttempt {
-      id: $attemptId,
-      timestamp: datetime(),
-      path: $path,
-      method: $method,
-      action: $action,
-      ip: $ip,
-      status: $status,
-      reason: $reason,
-      username: $username
-    })
-    MERGE (u)-[:TRIED_TO_ACCESS]->(attempt)
-    MERGE (attempt)-[:TARGET]->(res)
-    MERGE (attempt)-[:FROM_IP]->(ip)
-    RETURN attempt
-  `;
-
-  await runWrite(cypher, {
-    userId,
-    username,
-    path: resourcePath,
-    method,
-    action,
-    ip: ipAddress,
-    status,
-    reason,
-    attemptId,
-  });
-}
-
-/**
- * Règles de décision (non négociables) :
- * - Permission OK + IP connue        => AUTHORIZED
- * - Permission OK + IP nouvelle      => SUSPICIOUS
- * - Permission manquante             => REFUSED
- *
- * On considère que :
- * - Première IP pour l'utilisateur   => considérée comme connue (AUTHORIZED si permission OK)
- */
-async function decideAccess(req) {
-  debug('=== Décision d\'accès ===');
-  debug(`Méthode: ${req.method}, Chemin: ${req.path}`);
-  debug('Session:', req.session);
-  if (!req.session || !req.session.user) {
-    debug('Refus: aucune session utilisateur trouvée');
-    return {
-      status: 'REFUSED',
-      reason: 'no_session',
-      skipLogging: true, // pas d'utilisateur -> pas de log d'AccessAttempt
+  try {
+    const result = await runRead(cypher, { userId, ipAddress });
+    return result.records[0]?.get('ipState') || { 
+      isFirstIp: true, 
+      isKnownIp: false, 
+      knownIps: [],
+      totalIps: 0
+    };
+  } catch (error) {
+    debug('Erreur lors de la vérification de l\'état IP:', error);
+    return { 
+      isFirstIp: true, 
+      isKnownIp: false,
+      knownIps: [],
+      totalIps: 0
     };
   }
+}
 
-  const { userId, username } = req.session.user;
-  const method = req.method;
-  const action = httpMethodToAction(method);
-  const resourcePath = req.path; // ressource = route demandée (sans query)
-  const ipAddress = extractClientIp(req);
+/**
+ * Journalise une tentative d'accès
+ */
+async function logAccessAttempt(data) {
+  const {
+    userId,
+    username,
+    resourcePath,
+    method,
+    action,
+    ipAddress,
+    status,
+    reason,
+    userAgent = '',
+    referer = ''
+  } = data;
 
-  debug(`Vérification des permissions pour l'utilisateur ${userId} (${username})`);
-  debug(`Action: ${action}, Ressource: ${resourcePath}, IP: ${ipAddress}`);
-  
-  const [permissionOk, ipState] = await Promise.all([
-    hasPermission(userId, action, resourcePath),
-    getIpStateForUser(userId, ipAddress),
-  ]);
-  
-  debug(`Résultats - Permission: ${permissionOk}, État IP:`, ipState);
+  const attemptId = crypto.randomUUID();
+  const timestamp = new Date().toISOString();
 
-  let status;
-  let reason;
-
-  if (!permissionOk) {
-    status = 'REFUSED';
-    reason = 'no_permission';
-    debug('Refus: permissions insuffisantes');
-  } else {
-    if (ipState.isFirstIp || ipState.isKnownIp) {
-      status = 'AUTHORIZED';
-      reason = ipState.isFirstIp ? 'permission_ok_first_ip' : 'permission_ok_ip_known';
-    } else {
-      status = 'SUSPICIOUS';
-      reason = 'permission_ok_new_ip_detected';
-    }
-  }
-
-  // Enregistrement systématique de la tentative (si user existant)
-  if (userId) {
-    await logAccessAttempt({
+  try {
+    await runWrite(`
+      MATCH (u:User {id: $userId})
+      MERGE (ip:IP {address: $ipAddress})
+      ON CREATE SET 
+        ip.firstSeen = datetime($timestamp),
+        ip.lastSeen = datetime($timestamp)
+      ON MATCH SET 
+        ip.lastSeen = datetime($timestamp)
+      
+      MERGE (u)-[r:CONNECTS_FROM]->(ip)
+      ON CREATE SET 
+        r.firstSeen = datetime($timestamp),
+        r.lastSeen = datetime($timestamp)
+      ON MATCH SET 
+        r.lastSeen = datetime($timestamp)
+      
+      MERGE (res:Resource {path: $resourcePath})
+      ON CREATE SET 
+        res.createdAt = datetime($timestamp)
+      
+      CREATE (attempt:AccessAttempt {
+        id: $attemptId,
+        timestamp: datetime($timestamp),
+        path: $resourcePath,
+        method: $method,
+        action: $action,
+        status: $status,
+        reason: $reason,
+        userAgent: $userAgent,
+        referer: $referer
+      })
+      
+      MERGE (u)-[:MADE_ATTEMPT]->(attempt)
+      MERGE (attempt)-[:FROM_IP]->(ip)
+      MERGE (attempt)-[:TARGETED]->(res)
+      
+      RETURN attempt
+    `, {
       userId,
+      attemptId,
       username,
       resourcePath,
       method,
@@ -239,13 +243,145 @@ async function decideAccess(req) {
       ipAddress,
       status,
       reason,
+      userAgent,
+      referer,
+      timestamp
     });
+
+    debug(`Tentative d'accès enregistrée: ${status} - ${reason}`);
+  } catch (error) {
+    debug('Erreur lors de l\'enregistrement de la tentative d\'accès:', error);
+    // Ne pas propager l'erreur pour ne pas interrompre le flux
+  }
+}
+
+/**
+ * Prend une décision d'accès
+ */
+async function decideAccess(req) {
+  const startTime = Date.now();
+  const { method, path, headers, session } = req;
+  const action = httpMethodToAction(method);
+  const ipAddress = extractClientIp(req);
+  const userAgent = headers['user-agent'] || '';
+  const referer = headers.referer || '';
+
+  debug(`=== Décision d'accès pour ${method} ${path} ===`);
+  debug(`IP: ${ipAddress}, User-Agent: ${userAgent}`);
+
+  // Vérification de session
+  if (!session?.user) {
+    debug('Refus: aucune session utilisateur trouvée');
+    return {
+      status: 'REFUSED',
+      reason: 'no_session',
+      action,
+      ipAddress,
+      resourcePath: path,
+      timestamp: new Date().toISOString()
+    };
   }
 
-  return { status, reason, action, ipAddress, resourcePath };
+  const { userId, username } = session.user;
+
+  try {
+    // Vérification en parallèle des permissions et de l'état IP
+    const [permissionOk, ipState] = await Promise.all([
+      hasPermission(userId, action, path),
+      getIpStateForUser(userId, ipAddress)
+    ]);
+
+    debug(`Résultats - Permission: ${permissionOk}, État IP:`, ipState);
+
+    let status, reason, isSuspicious = false;
+
+    // Logique de décision
+    if (!permissionOk) {
+      status = 'REFUSED';
+      reason = 'no_permission';
+      debug('Refus: permissions insuffisantes');
+    } else if (ipState.isFirstIp) {
+      status = 'AUTHORIZED';
+      reason = 'first_ip_authorized';
+      debug('Autorisation accordée: première connexion depuis cette IP');
+    } else if (ipState.isKnownIp) {
+      status = 'AUTHORIZED';
+      reason = 'known_ip';
+      debug('Autorisation accordée: IP connue');
+    } else {
+      status = 'SUSPICIOUS';
+      reason = 'new_ip_detected';
+      isSuspicious = true;
+      debug('Activité suspecte: nouvelle IP détectée');
+    }
+
+    // Journalisation asynchrone (ne pas attendre)
+    logAccessAttempt({
+      userId,
+      username,
+      resourcePath: path,
+      method,
+      action,
+      ipAddress,
+      status,
+      reason,
+      userAgent,
+      referer,
+      processingTime: Date.now() - startTime
+    }).catch(error => {
+      debug('Erreur lors de la journalisation asynchrone:', error);
+    });
+
+    return {
+      status,
+      reason,
+      action,
+      ipAddress,
+      resourcePath: path,
+      isSuspicious,
+      ipState: {
+        isFirstIp: ipState.isFirstIp,
+        isKnownIp: ipState.isKnownIp,
+        totalIps: ipState.totalIps
+      },
+      timestamp: new Date().toISOString(),
+      processingTime: Date.now() - startTime
+    };
+
+  } catch (error) {
+    debug('Erreur lors de la prise de décision d\'accès:', error);
+    
+    // Journalisation de l'erreur
+    logAccessAttempt({
+      userId,
+      username,
+      resourcePath: path,
+      method,
+      action,
+      ipAddress,
+      status: 'ERROR',
+      reason: 'decision_error',
+      error: error.message,
+      userAgent,
+      referer
+    }).catch(err => debug('Erreur lors de la journalisation d\'erreur:', err));
+
+    return {
+      status: 'ERROR',
+      reason: 'internal_error',
+      action,
+      ipAddress,
+      resourcePath: path,
+      timestamp: new Date().toISOString(),
+      error: error.message
+    };
+  }
 }
 
 module.exports = {
   decideAccess,
+  hasPermission,
+  getIpStateForUser,
+  httpMethodToAction,
+  extractClientIp
 };
-
