@@ -13,8 +13,10 @@ router.get('/', permissionsController.getAllPermissions);
 // POST /permissions - Nécessite permission WRITE sur /permissions
 router.post('/', permissionsController.createPermission);
 
-// POST /permissions/:id/resource - Associe une permission à une ressource
+// POST /permissions/:name/resource - Associe une permission à une ressource
 // Nécessite permission WRITE sur /permissions
-router.post('/:id/resource', permissionsController.assignPermissionToResource);
+// Paramètre: name de la permission (ex: "READ_DASHBOARD")
+// Body: { resourcePath: "/dashboard" }
+router.post('/:name/resource', permissionsController.assignPermissionToResource);
 
 module.exports = router;
