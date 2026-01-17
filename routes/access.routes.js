@@ -15,4 +15,9 @@ router.get('/attempts', accessController.getAccessAttempts);
 // Nécessite permission READ sur /access
 router.get('/decision', accessController.getAccessDecision);
 
+// POST /access/check-permission - Vérifie si l'utilisateur a une permission spécifique
+// Body: { permission: 'READ_USERS' }
+// Nécessite d'être authentifié (vérifié par le middleware d'authentification)
+router.post('/check-permission', accessController.checkPermission);
+
 module.exports = router;

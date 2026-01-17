@@ -1,4 +1,4 @@
-const { decideAccess } = require('../services/accessDecision.service');
+const { checkUserPermission } = require('../services/permissions');
 const debug = require('debug')('app:access:control');
 const createError = require('http-errors');
 
@@ -60,6 +60,42 @@ function isPublicPath(path) {
 }
 
 /**
+ * Détermine la permission requise en fonction de la méthode HTTP et du chemin
+ */
+function determineRequiredPermission(method, path) {
+  // Nettoyage du chemin
+  const cleanPath = path.replace(/^\/+|\/+$/g, ''); // Supprime les / au début et à la fin
+  
+  // Détermination de l'action en fonction de la méthode HTTP
+  let action;
+  switch (method.toUpperCase()) {
+    case 'GET':
+      action = 'READ';
+      break;
+    case 'POST':
+      action = 'CREATE';
+      break;
+    case 'PUT':
+    case 'PATCH':
+      action = 'UPDATE';
+      break;
+    case 'DELETE':
+      action = 'DELETE';
+      break;
+    default:
+      action = 'EXECUTE';
+  }
+  
+  // Construction du nom de la permission
+  const resource = cleanPath
+    .replace(/\//g, '_')  // Remplace les / par _
+    .replace(/-/g, '_')    // Remplace les - par _
+    .toUpperCase();
+  
+  return `${action}_${resource}`;
+}
+
+/**
  * Middleware de contrôle d'accès principal
  */
 module.exports = async function accessControl(req, res, next) {
@@ -67,13 +103,14 @@ module.exports = async function accessControl(req, res, next) {
   const { method, path, headers, session } = req;
   const userAgent = headers['user-agent'] || '';
   const referer = headers.referer || '';
+  const ip = headers['x-forwarded-for'] || req.connection.remoteAddress;
 
   // Journalisation de la requête entrante
   debug(`\n=== [${new Date().toISOString()}] ${method} ${path} ===`);
   debug('Headers:', {
     'user-agent': userAgent,
     referer,
-    'x-forwarded-for': headers['x-forwarded-for'],
+    'x-forwarded-for': ip,
     'x-real-ip': headers['x-real-ip']
   });
 
@@ -99,84 +136,63 @@ module.exports = async function accessControl(req, res, next) {
     }));
   }
 
-  const { userId, username, role } = session.user;
+  const { userId, username, roles = [] } = session.user;
+  
+  // Vérification de l'ID utilisateur
+  if (!userId) {
+    debug('Accès refusé: ID utilisateur manquant dans la session');
+    return next(createError(401, {
+      code: 'INVALID_SESSION',
+      message: 'Session utilisateur invalide',
+      details: { username }
+    }));
+  }
 
   try {
-    // Journalisation du début de la vérification des permissions
-    debug(`Vérification des permissions pour l'utilisateur: ${username} (${userId})`);
-    debug(`Rôle: ${role}, IP: ${req.ip}`);
+    // Détermination de la permission requise
+    const requiredPermission = determineRequiredPermission(method, path);
+    
+    debug(`Vérification des permissions pour: ${username} (${userId})`);
+    debug(`Permission requise: ${requiredPermission}, Rôles: ${roles.join(', ')}`);
+    debug(`IP: ${ip}, Chemin: ${path}, Méthode: ${method}`);
 
-    // Décision d'accès
-    const decision = await decideAccess(req);
+    // Vérification de la permission
+    const hasPermission = await checkUserPermission(userId, requiredPermission);
+    
+    // Calcul du temps de traitement
     const processingTime = process.hrtime(startTime);
     const processingTimeMs = Math.round((processingTime[0] * 1000) + (processingTime[1] / 1000000));
 
     // Journalisation de la décision
     debug('Décision d\'accès:', {
-      status: decision.status,
-      reason: decision.reason,
+      status: hasPermission ? 'AUTHORIZED' : 'DENIED',
+      permission: requiredPermission,
       processingTime: `${processingTimeMs}ms`,
-      resource: decision.resourcePath,
-      action: decision.action,
-      ip: decision.ipAddress,
-      isSuspicious: decision.isSuspicious
+      resource: path,
+      method,
+      ip
     });
 
-    // Stockage de la décision pour une utilisation ultérieure
-    req.accessDecision = decision;
-
-    // Traitement en fonction du statut de la décision
-    switch (decision.status) {
-      case 'AUTHORIZED':
-        debug('Accès autorisé');
-        return next();
-
-      case 'SUSPICIOUS':
-        debug('Activité suspecte détectée');
-        // Envoyer une alerte mais autoriser l'accès
-        // (ou rediriger vers une vérification 2FA)
-        req.suspiciousActivity = true;
-        return next();
-
-      case 'REFUSED':
-      default:
-        const errorInfo = {
-          code: 'FORBIDDEN',
-          statusCode: 403,
-          message: 'Accès refusé'
-        };
-
-        // Personnalisation des messages d'erreur
-        if (decision.reason === 'no_session') {
-          errorInfo.code = 'UNAUTHENTICATED';
-          errorInfo.statusCode = 401;
-          errorInfo.message = 'Session expirée ou invalide';
-        } else if (decision.reason === 'suspicious_activity') {
-          errorInfo.code = 'TOO_MANY_REQUESTS';
-          errorInfo.statusCode = 429;
-          errorInfo.message = 'Trop de tentatives, veuillez réessayer plus tard';
-        } else if (decision.reason === 'ip_blocked') {
-          errorInfo.code = 'IP_BLOCKED';
-          errorInfo.statusCode = 403;
-          errorInfo.message = 'Votre adresse IP est bloquée temporairement';
-        }
-
-        debug(`Accès refusé: ${decision.reason} (HTTP ${errorInfo.statusCode})`);
-
-        return next(createError(errorInfo.statusCode, {
-          code: errorInfo.code,
-          message: errorInfo.message,
-          details: {
-            reason: decision.reason,
-            action: decision.action,
-            resource: decision.resourcePath,
-            ip: decision.ipAddress,
-            userId,
-            role,
-            timestamp: new Date().toISOString()
-          }
-        }));
+    if (hasPermission) {
+      debug('Accès autorisé');
+      return next();
     }
+    
+    // Accès refusé
+    debug(`Accès refusé: permission manquante (${requiredPermission})`);
+    return next(createError(403, {
+      code: 'FORBIDDEN',
+      message: 'Accès refusé',
+      details: {
+        permission: requiredPermission,
+        resource: path,
+        method,
+        roles,
+        userId,
+        timestamp: new Date().toISOString()
+      }
+    }));
+    
   } catch (error) {
     debug('Erreur critique lors de la vérification des permissions:', error);
     
@@ -184,7 +200,7 @@ module.exports = async function accessControl(req, res, next) {
     console.error('Erreur critique dans le contrôle d\'accès:', {
       error: error.message,
       stack: error.stack,
-      userId: session?.user?.userId,
+      userId,
       path,
       method,
       timestamp: new Date().toISOString()
@@ -203,3 +219,4 @@ module.exports = async function accessControl(req, res, next) {
 
 // Export pour les tests
 module.exports.isPublicPath = isPublicPath;
+module.exports.determineRequiredPermission = determineRequiredPermission;

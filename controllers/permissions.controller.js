@@ -1,23 +1,20 @@
 const { runRead, runWrite } = require('../services/neo4j.service');
-const crypto = require('crypto');
 
 /**
  * GET /permissions
- * Liste toutes les permissions
+ * Liste toutes les permissions (format: READ_DASHBOARD, WRITE_USERS, etc.)
  */
 async function getAllPermissions(req, res, next) {
   try {
     const cypher = `
       MATCH (p:Permission)
-      RETURN p.id AS id, p.action AS action, p.description AS description
-      ORDER BY p.action
+      RETURN p.name AS name
+      ORDER BY p.name
     `;
 
     const result = await runRead(cypher);
     const permissions = result.records.map((record) => ({
-      id: record.get('id'),
-      action: record.get('action'),
-      description: record.get('description'),
+      name: record.get('name'),
     }));
 
     res.json({ permissions });
@@ -29,37 +26,33 @@ async function getAllPermissions(req, res, next) {
 /**
  * POST /permissions
  * Crée une nouvelle permission
- * Body: { action (READ/WRITE/DELETE), description? }
+ * Body: { name (ex: "READ_REPORTS", "WRITE_SETTINGS") }
  */
 async function createPermission(req, res, next) {
   try {
-    const { action, description } = req.body;
+    const { name } = req.body;
 
-    if (!action) {
-      return res.status(400).json({ message: 'Action requise (READ, WRITE, DELETE)' });
+    if (!name) {
+      return res.status(400).json({ message: 'Nom de la permission requis (ex: READ_DASHBOARD)' });
     }
 
-    const permissionId = crypto.randomUUID();
+    // Vérifier le format (doit être ACTION_RESOURCE)
+    if (!name.match(/^(READ|WRITE|DELETE)_[A-Z]+$/)) {
+      return res.status(400).json({
+        message: 'Format invalide. Attendu: ACTION_RESOURCE (ex: READ_DASHBOARD, WRITE_USERS)'
+      });
+    }
 
     const cypher = `
-      CREATE (p:Permission {
-        id: $permissionId,
-        action: $action,
-        description: $description,
-        createdAt: datetime()
-      })
+      MERGE (p:Permission {name: $name})
       RETURN p
     `;
 
-    await runWrite(cypher, {
-      permissionId,
-      action,
-      description: description || null,
-    });
+    await runWrite(cypher, { name });
 
     res.status(201).json({
       message: 'Permission créée',
-      permission: { id: permissionId, action, description },
+      permission: { name },
     });
   } catch (err) {
     next(err);
@@ -67,27 +60,27 @@ async function createPermission(req, res, next) {
 }
 
 /**
- * POST /permissions/:id/resource
+ * POST /permissions/:name/resource
  * Associe une permission à une ressource
- * Body: { resourceId }
+ * Body: { resourcePath (ex: "/dashboard") }
  */
 async function assignPermissionToResource(req, res, next) {
   try {
-    const { id } = req.params;
-    const { resourceId } = req.body;
+    const { name } = req.params;
+    const { resourcePath } = req.body;
 
-    if (!resourceId) {
-      return res.status(400).json({ message: 'resourceId requis' });
+    if (!resourcePath) {
+      return res.status(400).json({ message: 'resourcePath requis' });
     }
 
     const cypher = `
-      MATCH (p:Permission {id: $permissionId})
-      MATCH (r:Resource {id: $resourceId})
+      MATCH (p:Permission {name: $name})
+      MATCH (r:Resource {path: $resourcePath})
       MERGE (p)-[:ACCESS_TO]->(r)
       RETURN p, r
     `;
 
-    const result = await runWrite(cypher, { permissionId: id, resourceId });
+    const result = await runWrite(cypher, { name, resourcePath });
 
     if (result.records.length === 0) {
       return res.status(404).json({ message: 'Permission ou Ressource non trouvée' });

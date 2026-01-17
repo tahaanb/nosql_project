@@ -182,7 +182,46 @@ async function getAccessDecision(req, res) {
   });
 }
 
+/**
+ * POST /access/check-permission
+ * Vérifie si l'utilisateur a une permission spécifique
+ * Body: { permission: string }
+ */
+async function checkPermission(req, res, next) {
+  const { permission: permissionName } = req.body;
+  const { username } = req.user;
+
+  if (!permissionName) {
+    return res.status(400).json({ 
+      error: 'Le paramètre "permission" est requis' 
+    });
+  }
+
+  try {
+    const cypher = `
+      MATCH (u:User {username: $username})-[:HAS_ROLE]->(r:Role)
+            -[:GRANTS]->(p:Permission {name: $permissionName})
+      RETURN COUNT(p) > 0 AS hasPermission
+    `;
+
+    const result = await runRead(cypher, { username, permissionName });
+    const hasPermission = result.records[0]?.get('hasPermission') || false;
+
+    res.json({ 
+      hasPermission,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Error checking permission:', error);
+    res.status(500).json({ 
+      error: 'Erreur lors de la vérification de la permission',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+}
+
 module.exports = {
   getAccessAttempts,
-  getAccessDecision
+  getAccessDecision,
+  checkPermission
 };

@@ -1,159 +1,196 @@
 const { runRead, runWrite } = require('../services/neo4j.service');
-const crypto = require('crypto');
 
 /**
- * GET /roles
- * Liste tous les rôles
+ * Récupère tous les rôles
  */
-async function getAllRoles(req, res, next) {
-  try {
-    const cypher = `
-      MATCH (r:Role)
-      RETURN r.id AS id, r.name AS name, r.description AS description
-      ORDER BY r.name
-    `;
-
-    const result = await runRead(cypher);
-    const roles = result.records.map((record) => ({
-      id: record.get('id'),
-      name: record.get('name'),
-      description: record.get('description'),
-    }));
-
-    res.json({ roles });
-  } catch (err) {
-    next(err);
-  }
-}
+const getAllRoles = async (req, res) => {
+    try {
+        const result = await runRead('MATCH (r:Role) RETURN r');
+        const roles = result.records.map(record => record.get('r').properties);
+        res.json(roles);
+    } catch (error) {
+        console.error('Error getting roles:', error);
+        res.status(500).json({ error: 'Failed to get roles', details: error.message });
+    }
+};
 
 /**
- * POST /roles
  * Crée un nouveau rôle
- * Body: { name, description? }
  */
-async function createRole(req, res, next) {
-  try {
+const createRole = async (req, res) => {
+    const { name, description } = req.body;
+    if (!name) {
+        return res.status(400).json({ error: 'Role name is required' });
+    }
+
+    try {
+        const result = await runWrite(
+            'CREATE (r:Role {name: $name, description: $description}) RETURN r',
+            { name, description: description || null }
+        );
+        
+        if (!result.records.length) {
+            throw new Error('Failed to create role');
+        }
+        
+        const role = result.records[0].get('r').properties;
+        res.status(201).json(role);
+    } catch (error) {
+        console.error('Error creating role:', error);
+        res.status(500).json({ 
+            error: 'Failed to create role',
+            details: error.message 
+        });
+    }
+};
+
+/**
+ * Met à jour un rôle existant
+ */
+const updateRole = async (req, res) => {
+    const { id } = req.params;
     const { name, description } = req.body;
 
     if (!name) {
-      return res.status(400).json({ message: 'Nom du rôle requis' });
+        return res.status(400).json({ error: 'Role name is required' });
     }
 
-    const roleId = crypto.randomUUID();
+    try {
+        // Vérifier d'abord si le rôle existe
+        const checkResult = await runRead(
+            'MATCH (r:Role) WHERE id(r) = toInteger($id) RETURN r',
+            { id }
+        );
 
-    const cypher = `
-      CREATE (r:Role {
-        id: $roleId,
-        name: $name,
-        description: $description,
-        createdAt: datetime()
-      })
-      RETURN r
-    `;
+        if (checkResult.records.length === 0) {
+            return res.status(404).json({ 
+                error: 'Role not found',
+                details: `Role with ID ${id} does not exist`
+            });
+        }
 
-    await runWrite(cypher, {
-      roleId,
-      name,
-      description: description || null,
-    });
+        // Mettre à jour le rôle
+        const result = await runWrite(
+            'MATCH (r:Role) WHERE id(r) = toInteger($id) ' +
+            'SET r.name = $name, r.description = $description, r.updatedAt = datetime() ' +
+            'RETURN r',
+            { 
+                id, 
+                name, 
+                description: description || null 
+            }
+        );
 
-    res.status(201).json({
-      message: 'Rôle créé',
-      role: { id: roleId, name, description },
-    });
-  } catch (err) {
-    next(err);
-  }
-}
+        if (!result.records.length) {
+            throw new Error('Failed to update role');
+        }
 
-/**
- * PUT /roles/:id
- * Met à jour un rôle
- * Body: { name?, description? }
- */
-async function updateRole(req, res, next) {
-  try {
-    const { id } = req.params;
-    const { name, description } = req.body;
-
-    const cypher = `
-      MATCH (r:Role {id: $id})
-      SET r.name = COALESCE($name, r.name),
-          r.description = COALESCE($description, r.description),
-          r.updatedAt = datetime()
-      RETURN r
-    `;
-
-    const result = await runWrite(cypher, { id, name, description });
-
-    if (result.records.length === 0) {
-      return res.status(404).json({ message: 'Rôle non trouvé' });
+        const role = result.records[0].get('r').properties;
+        res.json(role);
+    } catch (error) {
+        console.error('Error updating role:', error);
+        res.status(500).json({ 
+            error: 'Failed to update role',
+            details: error.message 
+        });
     }
-
-    res.json({ message: 'Rôle mis à jour' });
-  } catch (err) {
-    next(err);
-  }
-}
+};
 
 /**
- * DELETE /roles/:id
  * Supprime un rôle
  */
-async function deleteRole(req, res, next) {
-  try {
+const deleteRole = async (req, res) => {
     const { id } = req.params;
 
-    const cypher = `
-      MATCH (r:Role {id: $id})
-      DETACH DELETE r
-    `;
+    try {
+        // Vérifier d'abord si le rôle existe
+        const checkResult = await runRead(
+            'MATCH (r:Role) WHERE id(r) = toInteger($id) RETURN r',
+            { id }
+        );
 
-    await runWrite(cypher, { id });
+        if (checkResult.records.length === 0) {
+            return res.status(404).json({ 
+                error: 'Role not found',
+                details: `Role with ID ${id} does not exist`
+            });
+        }
 
-    res.json({ message: 'Rôle supprimé' });
-  } catch (err) {
-    next(err);
-  }
-}
+        // Supprimer le rôle et toutes ses relations
+        await runWrite(
+            'MATCH (r:Role) WHERE id(r) = toInteger($id) ' +
+            'DETACH DELETE r',
+            { id }
+        );
+
+        res.status(204).send();
+    } catch (error) {
+        console.error('Error deleting role:', error);
+        res.status(500).json({ 
+            error: 'Failed to delete role',
+            details: error.message
+        });
+    }
+};
 
 /**
- * POST /roles/:id/permissions
  * Associe une permission à un rôle
- * Body: { permissionId }
  */
-async function assignPermissionToRole(req, res, next) {
-  try {
-    const { id } = req.params;
-    const { permissionId } = req.body;
+const assignPermissionToRole = async (req, res) => {
+    const { name } = req.params;
+    const { permissionName } = req.body;
 
-    if (!permissionId) {
-      return res.status(400).json({ message: 'permissionId requis' });
+    if (!permissionName) {
+        return res.status(400).json({ 
+            error: 'Permission name is required',
+            details: 'Please provide permissionName in the request body'
+        });
     }
 
-    const cypher = `
-      MATCH (r:Role {id: $roleId})
-      MATCH (p:Permission {id: $permissionId})
-      MERGE (r)-[:GRANTS]->(p)
-      RETURN r, p
-    `;
+    try {
+        // Vérifier que le rôle et la permission existent
+        const checkResult = await runRead(
+            'MATCH (r:Role {name: $name}), (p:Permission {name: $permissionName}) ' +
+            'RETURN r, p',
+            { name, permissionName }
+        );
 
-    const result = await runWrite(cypher, { roleId: id, permissionId });
+        if (checkResult.records.length === 0) {
+            return res.status(404).json({ 
+                error: 'Role or Permission not found',
+                details: `Role '${name}' or Permission '${permissionName}' does not exist`
+            });
+        }
 
-    if (result.records.length === 0) {
-      return res.status(404).json({ message: 'Rôle ou Permission non trouvé' });
+        // Créer la relation GRANTS (au lieu de HAS_PERMISSION pour être cohérent avec le reste du code)
+        const result = await runWrite(
+            'MATCH (r:Role {name: $name}), (p:Permission {name: $permissionName}) ' +
+            'MERGE (r)-[rel:GRANTS]->(p) ' +
+            'RETURN rel',
+            { name, permissionName }
+        );
+
+        if (!result.records.length) {
+            throw new Error('Failed to assign permission to role');
+        }
+
+        res.status(201).json({ 
+            success: true,
+            message: `Permission '${permissionName}' successfully assigned to role '${name}'`
+        });
+    } catch (error) {
+        console.error('Error assigning permission to role:', error);
+        res.status(500).json({ 
+            error: 'Failed to assign permission to role',
+            details: error.message
+        });
     }
-
-    res.json({ message: 'Permission associée au rôle' });
-  } catch (err) {
-    next(err);
-  }
-}
+};
 
 module.exports = {
-  getAllRoles,
-  createRole,
-  updateRole,
-  deleteRole,
-  assignPermissionToRole,
+    getAllRoles,
+    createRole,
+    updateRole,
+    deleteRole,
+    assignPermissionToRole
 };
